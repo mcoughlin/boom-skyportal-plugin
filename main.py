@@ -740,6 +740,18 @@ def main():
                         log(f"Updated super object with id {super_obj.id} to associate {obj_id} with new matches: {', '.join(sorted(new_associated_obj_ids))}")
             session.commit()
 
+        # The message is now fully ingested and committed to Postgres, so advance
+        # the Kafka consumer group's offset past it. enable.auto.commit is False,
+        # so this is the only place offsets move forward. Committing only after a
+        # successful write gives at-least-once delivery, which is safe because
+        # duplicate candidates are rejected by the IntegrityError guard above
+        # (effectively-once). This is what lets several consumers in the same group
+        # rebalance/restart without replaying the whole topic retention each time.
+        # Commit asynchronously so the poll loop is not blocked on a broker
+        # round-trip per message; the small replay window on an unclean shutdown is
+        # harmless given the idempotent writes.
+        consumer.commit(message=msg, asynchronous=True)
+
 
 if __name__ == "__main__":
     main()
