@@ -5,7 +5,6 @@ import json
 import traceback
 from datetime import datetime, timedelta, timezone
 
-import fastavro
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -18,10 +17,14 @@ from astropy.visualization import (
     LinearStretch,
     LogStretch,
 )
-from confluent_kafka import Consumer, KafkaError
 from scipy.ndimage import rotate
 from sqlalchemy.orm.session import Session
 from sqlalchemy.exc import IntegrityError
+
+# NOTE: ``fastavro`` (read_avro) and ``confluent_kafka`` (main) are imported
+# lazily inside the functions that use them, so that the pure ingestion logic
+# — process_record / ingest_photometry_array — can be imported and tested in
+# environments that don't have the Kafka/Avro broker dependencies installed.
 
 from baselayer.app.env import load_env
 from baselayer.app.models import init_db
@@ -43,15 +46,12 @@ from skyportal.models import (
 
 matplotlib.pyplot.switch_backend("Agg")
 
-env, cfg = load_env()
 log = make_log("boom")
 
-init_db(**cfg["database"])
-
-params = cfg.get("services.external.boom.params", {})
-kafka_params = params.get("kafka", {})
-# fallback to the top-level "boom" config if any
-api_params = params.get("api", cfg.get("boom", {}))
+# NOTE: config loading and DB initialization deliberately do NOT run at import
+# time — they happen in main(). This keeps `import main` side-effect-free so the
+# pure ingestion logic (process_record, ingest_photometry_array, ...) can be
+# exercised from tests against an already-initialized DB session.
 
 thumbnail_types = [
     ("cutoutScience", "new"),
@@ -398,6 +398,8 @@ def read_avro(msg):
         The first record found in the Avro file, or None if no records are found
     """
 
+    import fastavro
+
     bytes_io = io.BytesIO(msg.value())  # Get the message value as bytes
     bytes_io.seek(0)
     for record in fastavro.reader(bytes_io):
@@ -462,7 +464,246 @@ def make_boom_filters(session: Session):
     return boom_filters
 
 
+def process_record(
+    record,
+    session,
+    *,
+    boom_filters,
+    programid2streamid,
+    survey2instrumentid,
+    user,
+    boom_client,
+):
+    """Process a single decoded BOOM alert ``record`` against ``session``.
+
+    For each passing filter this creates the Obj (and thumbnails on first
+    sight), a Candidate, and an Annotation; then ingests photometry for the
+    main object and any cross-survey matches, and maintains SuperObj
+    associations. The caller owns the Kafka loop and session lifecycle.
+
+    ``boom_filters`` may be refreshed from the DB when the record references a
+    filter not yet known; the (possibly updated) mapping is returned so the
+    caller keeps using the latest version.
+    """
+    obj_id = record["objectId"]
+    survey = record["survey"].upper()
+
+    # we consider that a candidate already exists if:
+    # - there is an entry with the same candid (passing_alert_id) and filter_id, or
+    # - there is an entry with the same obj_id, passed_at, and filter_id (DB has a unique index on these 3 fields)
+    candid = record["candid"]
+    passed_at_by_filter_id = {f["filter_id"]: datetime.fromtimestamp(f["passed_at"] / 1000, timezone.utc) for f in record["filters"]}
+    existing_fids = set()
+    for filter_id in passed_at_by_filter_id:
+        fid = boom_filters.get(filter_id, {}).get("id")
+        if fid is not None:
+            existing_fids.add(fid)
+
+    existing_candidates = session.scalars(
+        sa.select(
+            Candidate,
+        ).where(Candidate.obj_id == obj_id, Candidate.filter_id.in_(existing_fids))
+    ).all()
+    passed_filter_ids = set()
+    for candidate in existing_candidates:
+        passed_at = passed_at_by_filter_id.get(candidate.filter_id)
+        if candidate.passing_alert_id == candid:
+            passed_filter_ids.add(candidate.filter_id)
+        elif passed_at and candidate.passed_at == passed_at:
+            passed_filter_ids.add(candidate.filter_id)
+
+    obj = None
+    created_candidates = False
+    for filter_data in record["filters"]:
+        filt = boom_filters.get(filter_data["filter_id"])
+        if filt is None:
+            # if filter_data["filter_id"] is in the EXTERNAL_FILTER_IDS set, it means
+            # we know this filter is not in the database, so we skip it without logging
+            if filter_data["filter_id"] in EXTERNAL_FILTER_IDS:
+                continue
+            # else we try to refresh the filter list from the database, in case
+            # new filters have been added since the start of the program
+            boom_filters = make_boom_filters(session)
+            filt = boom_filters.get(filter_data["filter_id"])
+            if filt is None:
+                log(
+                    f"Filter with id {filter_data['filter_id']} does not exist in SkyPortal"
+                )
+                EXTERNAL_FILTER_IDS.add(filter_data["filter_id"])
+                continue
+        if filt["id"] in passed_filter_ids:
+            continue
+
+        # create the object if one filter has passed and the object has not been created yet
+        if obj is None:
+            obj, obj_created = get_or_create_object(
+                obj_id,
+                record["ra"],
+                record["dec"],
+                session
+            )
+            if obj_created:
+                add_thumbnails(record, survey, session)
+
+        # create the candidate if it has not been created yet for this filter and this candid
+        try:
+            with session.begin_nested():
+                candidate = Candidate(
+                    obj=obj,
+                    filter_id=filt["id"],
+                    passed_at=passed_at_by_filter_id[filter_data["filter_id"]],
+                    passing_alert_id=candid,
+                    uploader_id=1
+                )
+                session.add(candidate)
+        except IntegrityError as e:
+            log(f"IntegrityError: Duplicate candidate for obj_id {obj_id}, filter {filt['id']}: {e}")
+            continue
+        except Exception as e:
+            log(f"Error creating candidate with candid {candid} and filter {filt['id']}: {e}")
+            continue # If the candidate is not created successfully, we skip the annotation creation
+
+        created_candidates = True
+        log(f"Created candidate with candid {candid}")
+        try:
+            with session.begin_nested():
+                annotation_data = json.loads(filter_data["annotations"])
+
+                group_name = filt["group"].get("nickname")
+                if group_name is None: # if nickname is not present, use the name
+                    group_name = filt["group"]["name"]
+                origin = f"{group_name}:{filt['name']}"
+
+                existing_annotation = session.scalar(
+                    sa.select(Annotation).filter(
+                        Annotation.obj_id == obj_id, Annotation.origin == origin
+                    )
+                )
+                if existing_annotation is None:
+                    annotation = Annotation(
+                        obj=obj, data=annotation_data, origin=origin, author_id=1
+                    )
+                    session.add(annotation)
+                    log(f"Created annotation with origin {origin}")
+                else:
+                    # we update the data of the annotation
+                    existing_annotation.data = annotation_data
+                    log(f"Updated annotation with origin {origin}")
+        except Exception as e:
+            log(f"Error processing annotation for object {obj_id} and filter {filt['id']}: {e}")
+
+    if not created_candidates:
+        # log(f"No new candidates created for object {obj_id} with candid {candid}")
+        return boom_filters
+
+    session.commit()
+
+    ingest_photometry_array(
+        record.get("photometry", []),
+        obj_id,
+        user,
+        session,
+        programid2streamid,
+        survey2instrumentid,
+    )
+
+    session.commit()
+
+    # Ingest cross-survey matches (object + photometry), if provided.
+    survey_matches: dict[str, dict] = record.get("survey_matches", {})
+    associated_with = set()
+    if isinstance(survey_matches, dict):
+        for match_survey, match in survey_matches.items():
+            match_survey = match_survey.upper()
+            # we never have matches with the same survey as the main object,
+            # so let's skip those just in case
+            if match is None or match_survey == survey or not isinstance(match, dict):
+                continue
+
+            match_obj_id = match["objectId"]
+
+            _, match_obj_created = get_or_create_object(
+                match_obj_id,
+                match["ra"],
+                match["dec"],
+                session,
+            )
+
+            # TODO: grab the cutouts for the match object (if newly added) from the BOOM API
+            if match_obj_created:
+                try:
+                    cutouts = boom_client.get_cutouts_by_object_id(
+                        match_survey, match_obj_id
+                    )
+                    add_thumbnails(cutouts, match_survey, session)
+                except Exception as e:
+                    log(
+                        f"Failed to get cutouts for match object {match_obj_id} from survey {match_survey}: {e}"
+                    )
+
+            ingest_photometry_array(
+                match["photometry"],
+                match_obj_id,
+                user,
+                session,
+                programid2streamid,
+                survey2instrumentid,
+            )
+
+            associated_with.add(match_obj_id)
+
+    if associated_with:
+        # first we check if this object is already part of a super object
+        super_obj = session.scalar(
+            sa.select(SuperObj).join(ObjToSuperObj).where(ObjToSuperObj.obj_id == obj_id)
+        )
+        if super_obj is None:
+            # if not, we create a new super object and associate the main object and the matches with it
+            super_obj = SuperObj()
+            session.add(super_obj)
+            session.flush()  # flush to get the super_obj.id
+
+            obj_to_superobj = ObjToSuperObj(obj_id=obj_id, super_obj_id=super_obj.id)
+            session.add(obj_to_superobj)
+
+            for match_obj_id in associated_with:
+                match_obj_to_superobj = ObjToSuperObj(
+                    obj_id=match_obj_id, super_obj_id=super_obj.id
+                )
+                session.add(match_obj_to_superobj)
+
+            log(f"Created super object with id {super_obj.id} and associated {obj_id} with matches: {', '.join(sorted(associated_with))}")
+        else:
+            # if the super object already exists, we just need to associate the matches with it (the main object is already associated)
+            existing_associations_obj_ids = session.scalars(
+                sa.select(ObjToSuperObj.obj_id).where(
+                    ObjToSuperObj.super_obj_id == super_obj.id,
+                )
+            ).all()
+            new_associated_obj_ids = associated_with - set(existing_associations_obj_ids)
+            for match_obj_id in new_associated_obj_ids:
+                match_obj_to_superobj = ObjToSuperObj(
+                    obj_id=match_obj_id, super_obj_id=super_obj.id
+                )
+                session.add(match_obj_to_superobj)
+            if new_associated_obj_ids:
+                log(f"Updated super object with id {super_obj.id} to associate {obj_id} with new matches: {', '.join(sorted(new_associated_obj_ids))}")
+    session.commit()
+
+    return boom_filters
+
+
 def main():
+    from confluent_kafka import Consumer, KafkaError
+
+    _, cfg = load_env()
+    init_db(**cfg["database"])
+
+    params = cfg.get("services.external.boom.params", {})
+    kafka_params = params.get("kafka", {})
+    # fallback to the top-level "boom" config if any
+    api_params = params.get("api", cfg.get("boom", {}))
+
     boom_client = BoomAPIClient(
         protocol=api_params.get("protocol", "https"),
         host=api_params.get("host", "api.kaboom.caltech.edu"),
@@ -554,210 +795,15 @@ def main():
 
         try:
             with DBSession() as session:
-                obj_id = record["objectId"]
-                survey = record["survey"].upper()
-
-                # we consider that a candidate already exists if:
-                # - there is an entry with the same candid (passing_alert_id) and filter_id, or
-                # - there is an entry with the same obj_id, passed_at, and filter_id (DB has a unique index on these 3 fields)
-                candid = record["candid"]
-                passed_at_by_filter_id = {f["filter_id"]: datetime.fromtimestamp(f["passed_at"] / 1000, timezone.utc) for f in record["filters"]}
-                existing_fids = set()
-                for filter_id in passed_at_by_filter_id:
-                    fid = boom_filters.get(filter_id, {}).get("id")
-                    if fid is not None:
-                        existing_fids.add(fid)
-
-                existing_candidates = session.scalars(
-                    sa.select(
-                        Candidate,
-                    ).where(Candidate.obj_id == obj_id, Candidate.filter_id.in_(existing_fids))
-                ).all()
-                passed_filter_ids = set()
-                for candidate in existing_candidates:
-                    passed_at = passed_at_by_filter_id.get(candidate.filter_id)
-                    if candidate.passing_alert_id == candid:
-                        passed_filter_ids.add(candidate.filter_id)
-                    elif passed_at and candidate.passed_at == passed_at:
-                        passed_filter_ids.add(candidate.filter_id)
-
-                obj = None
-                created_candidates = False
-                for filter_data in record["filters"]:
-                    filt = boom_filters.get(filter_data["filter_id"])
-                    if filt is None:
-                        # if filter_data["filter_id"] is in the EXTERNAL_FILTER_IDS set, it means
-                        # we know this filter is not in the database, so we skip it without logging
-                        if filter_data["filter_id"] in EXTERNAL_FILTER_IDS:
-                            continue
-                        # else we try to refresh the filter list from the database, in case
-                        # new filters have been added since the start of the program
-                        boom_filters = make_boom_filters(session)
-                        filt = boom_filters.get(filter_data["filter_id"])
-                        if filt is None:
-                            log(
-                                f"Filter with id {filter_data['filter_id']} does not exist in SkyPortal"
-                            )
-                            EXTERNAL_FILTER_IDS.add(filter_data["filter_id"])
-                            continue
-                    if filt["id"] in passed_filter_ids:
-                        continue
-
-                    # create the object if one filter has passed and the object has not been created yet
-                    if obj is None:
-                        obj, obj_created = get_or_create_object(
-                            obj_id,
-                            record["ra"],
-                            record["dec"],
-                            session
-                        )
-                        if obj_created:
-                            add_thumbnails(record, survey, session)
-
-                    # create the candidate if it has not been created yet for this filter and this candid
-                    try:
-                        with session.begin_nested():
-                            candidate = Candidate(
-                                obj=obj,
-                                filter_id=filt["id"],
-                                passed_at=passed_at_by_filter_id[filter_data["filter_id"]],
-                                passing_alert_id=candid,
-                                uploader_id=1
-                            )
-                            session.add(candidate)
-                    except IntegrityError as e:
-                        log(f"IntegrityError: Duplicate candidate for obj_id {obj_id}, filter {filt['id']}: {e}")
-                        continue
-                    except Exception as e:
-                        log(f"Error creating candidate with candid {candid} and filter {filt['id']}: {e}")
-                        continue # If the candidate is not created successfully, we skip the annotation creation
-
-                    created_candidates = True
-                    log(f"Created candidate with candid {candid}")
-                    try:
-                        with session.begin_nested():
-                            annotation_data = json.loads(filter_data["annotations"])
-
-                            group_name = filt["group"].get("nickname")
-                            if group_name is None: # if nickname is not present, use the name
-                                group_name = filt["group"]["name"]
-                            origin = f"{group_name}:{filt['name']}"
-
-                            existing_annotation = session.scalar(
-                                sa.select(Annotation).filter(
-                                    Annotation.obj_id == obj_id, Annotation.origin == origin
-                                )
-                            )
-                            if existing_annotation is None:
-                                annotation = Annotation(
-                                    obj=obj, data=annotation_data, origin=origin, author_id=1
-                                )
-                                session.add(annotation)
-                                log(f"Created annotation with origin {origin}")
-                            else:
-                                # we update the data of the annotation
-                                existing_annotation.data = annotation_data
-                                log(f"Updated annotation with origin {origin}")
-                    except Exception as e:
-                        log(f"Error processing annotation for object {obj_id} and filter {filt['id']}: {e}")
-
-                if not created_candidates:
-                    # log(f"No new candidates created for object {obj_id} with candid {candid}")
-                    continue
-
-                session.commit()
-
-                ingest_photometry_array(
-                    record.get("photometry", []),
-                    obj_id,
-                    user,
+                boom_filters = process_record(
+                    record,
                     session,
-                    programid2streamid,
-                    survey2instrumentid,
+                    boom_filters=boom_filters,
+                    programid2streamid=programid2streamid,
+                    survey2instrumentid=survey2instrumentid,
+                    user=user,
+                    boom_client=boom_client,
                 )
-
-                session.commit()
-
-                # Ingest cross-survey matches (object + photometry), if provided.
-                survey_matches: dict[str, dict] = record.get("survey_matches", {})
-                associated_with = set()
-                if isinstance(survey_matches, dict):
-                    for match_survey, match in survey_matches.items():
-                        match_survey = match_survey.upper()
-                        # we never have matches with the same survey as the main object,
-                        # so let's skip those just in case
-                        if match is None or match_survey == survey or not isinstance(match, dict):
-                            continue
-
-                        match_obj_id = match["objectId"]
-
-                        _, match_obj_created = get_or_create_object(
-                            match_obj_id,
-                            match["ra"],
-                            match["dec"],
-                            session,
-                        )
-
-                        # TODO: grab the cutouts for the match object (if newly added) from the BOOM API
-                        if match_obj_created:
-                            try:
-                                cutouts = boom_client.get_cutouts_by_object_id(
-                                    match_survey, match_obj_id
-                                )
-                                add_thumbnails(cutouts, match_survey, session)
-                            except Exception as e:
-                                log(
-                                    f"Failed to get cutouts for match object {match_obj_id} from survey {match_survey}: {e}"
-                                )
-
-                        ingest_photometry_array(
-                            match["photometry"],
-                            match_obj_id,
-                            user,
-                            session,
-                            programid2streamid,
-                            survey2instrumentid,
-                        )
-
-                        associated_with.add(match_obj_id)
-
-                if associated_with:
-                    # first we check if this object is already part of a super object
-                    super_obj = session.scalar(
-                        sa.select(SuperObj).join(ObjToSuperObj).where(ObjToSuperObj.obj_id == obj_id)
-                    )
-                    if super_obj is None:
-                        # if not, we create a new super object and associate the main object and the matches with it
-                        super_obj = SuperObj()
-                        session.add(super_obj)
-                        session.flush()  # flush to get the super_obj.id
-
-                        obj_to_superobj = ObjToSuperObj(obj_id=obj_id, super_obj_id=super_obj.id)
-                        session.add(obj_to_superobj)
-
-                        for match_obj_id in associated_with:
-                            match_obj_to_superobj = ObjToSuperObj(
-                                obj_id=match_obj_id, super_obj_id=super_obj.id
-                            )
-                            session.add(match_obj_to_superobj)
-
-                        log(f"Created super object with id {super_obj.id} and associated {obj_id} with matches: {', '.join(sorted(associated_with))}")
-                    else:
-                        # if the super object already exists, we just need to associate the matches with it (the main object is already associated)
-                        existing_associations_obj_ids = session.scalars(
-                            sa.select(ObjToSuperObj.obj_id).where(
-                                ObjToSuperObj.super_obj_id == super_obj.id,
-                            )
-                        ).all()
-                        new_associated_obj_ids = associated_with - set(existing_associations_obj_ids)
-                        for match_obj_id in new_associated_obj_ids:
-                            match_obj_to_superobj = ObjToSuperObj(
-                                obj_id=match_obj_id, super_obj_id=super_obj.id
-                            )
-                            session.add(match_obj_to_superobj)
-                        if new_associated_obj_ids:
-                            log(f"Updated super object with id {super_obj.id} to associate {obj_id} with new matches: {', '.join(sorted(new_associated_obj_ids))}")
-                session.commit()
         except Exception as e:
             traceback.print_exc()
             log(
