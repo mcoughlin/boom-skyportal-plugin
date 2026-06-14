@@ -5,8 +5,6 @@ import json
 import traceback
 from datetime import datetime, timedelta, timezone
 
-import matplotlib
-import matplotlib.pyplot as plt
 import numpy as np
 import requests
 import sqlalchemy as sa
@@ -17,6 +15,8 @@ from astropy.visualization import (
     LinearStretch,
     LogStretch,
 )
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
 from scipy.ndimage import rotate
 from sqlalchemy.orm.session import Session
 from sqlalchemy.exc import IntegrityError
@@ -43,8 +43,6 @@ from skyportal.models import (
     Stream,
     User,
 )
-
-matplotlib.pyplot.switch_backend("Agg")
 
 log = make_log("boom")
 
@@ -191,33 +189,25 @@ def boom_origin_to_skyportal_origin(boom_origin):
         raise ValueError(f"Unknown Boom photometry origin: {boom_origin}")
 
 
-def ingest_photometry_array(
-    photometry_array,
-    obj_id,
-    user,
-    session,
-    programid2streamid,
-    survey2instrumentid,
-):
-    """Ingest photometry data from Boom into SkyPortal.
+MAX_PHOT_ROWS_PER_POST = 8000  # keep each aggregated post under SkyPortal's cap
 
-    Parameters
-    ----------
-    photometry_array : list[dict]
-        A list of photometry points, where each point is a dictionary containing the photometry data in Boom format.
-    obj_id : str
-        The ID of the object to which the photometry belongs.
-    user : User
-        The user performing the ingestion, used for attribution in SkyPortal.
-    session : Session
-        The database session to use for any necessary queries during ingestion.
-    programid2streamid : dict[tuple[str, int], list[int]]
-        A mapping from (survey, programid) to a list of stream IDs in SkyPortal, used to determine which streams to associate the photometry with based on its survey and programid.
-    survey2instrumentid : dict[str, int]
-        A mapping from survey names to instrument IDs in SkyPortal. This is used to determine which instrument to associate the photometry with based on its survey.
+
+def _new_phot_group(instrument_id, stream_ids):
+    return {
+        "obj_id": [], "group_ids": [1], "stream_ids": stream_ids,
+        "instrument_id": instrument_id, "mjd": [], "flux": [], "fluxerr": [],
+        "filter": [], "zp": [], "magsys": [], "ra": [], "dec": [], "origin": [],
+    }
+
+
+def accumulate_photometry_array(
+    acc, seen, photometry_array, obj_id, programid2streamid, survey2instrumentid
+):
+    """Append a Boom object's SNT/dedup-filtered photometry into per-(instrument,
+    streams) accumulators, with obj_id carried per point so many objects can be
+    posted in one cross-object call. ``seen`` dedups on the SkyPortal dedup key
+    (incl. obj_id) so re-detections across a batch don't collide on the upsert.
     """
-    # Group points by (survey, programid) and submit each chunk to SkyPortal.
-    photometry_data = {}
     for phot in photometry_array:
         try:
             origin = boom_origin_to_skyportal_origin(phot["origin"])
@@ -231,55 +221,107 @@ def ingest_photometry_array(
             continue
 
         survey = str(phot["survey"]).upper()
-        key = (survey, phot["programid"])
-        if key not in photometry_data:
-            stream_ids = programid2streamid.get(key)
-            if stream_ids is None:
-                log(
-                    f"No stream found for survey {survey} and programid {phot['programid']}, skipping photometry"
-                )
-                continue
-            instrument_id = survey2instrumentid.get(survey)
-            if instrument_id is None:
-                log(f"No instrument found for survey {survey}, skipping photometry")
-                continue
-            photometry_data[key] = {
-                "obj_id": obj_id,
-                "group_ids": [1],
-                "stream_ids": stream_ids,
-                "instrument_id": instrument_id,
-                "mjd": [],
-                "flux": [],
-                "fluxerr": [],
-                "filter": [],
-                "zp": [],
-                "magsys": [],
-                "ra": [],
-                "dec": [],
-                "origin": [],
-            }
+        stream_ids = programid2streamid.get((survey, phot["programid"]))
+        if stream_ids is None:
+            log(
+                f"No stream found for survey {survey} and programid {phot['programid']}, skipping photometry"
+            )
+            continue
+        instrument_id = survey2instrumentid.get(survey)
+        if instrument_id is None:
+            log(f"No instrument found for survey {survey}, skipping photometry")
+            continue
 
-        photometry_data[key]["mjd"].append(phot["jd"] - 2400000.5)
         flux = phot["flux"]
         if flux is not None and not np.isnan(flux):
             flux = flux * 1e-9  # convert from nJy to Jy
         flux_err = phot["flux_err"] * 1e-9  # convert from nJy to Jy
-
-        # if the signal-to-noise ratio is below the threshold, we set the flux to None
-        # to avoid ingesting unreliable photometry shown as detections
+        # below the S/N threshold we null the flux (rendered as a non-detection)
         if flux is not None and abs(flux / flux_err) < SNT:
             flux = None
-        photometry_data[key]["flux"].append(flux)
-        photometry_data[key]["fluxerr"].append(flux_err)
-        photometry_data[key]["filter"].append(phot["band"])
-        photometry_data[key]["zp"].append(ZP_PER_SURVEY[survey])
-        photometry_data[key]["magsys"].append("ab")
-        photometry_data[key]["ra"].append(phot["ra"])
-        photometry_data[key]["dec"].append(phot["dec"])
-        photometry_data[key]["origin"].append(origin)
+        mjd = phot["jd"] - 2400000.5
 
-    for _, data in photometry_data.items():
-        add_external_photometry(data, user, session)
+        group_key = (instrument_id, tuple(stream_ids))
+        dedup_key = (group_key, obj_id, origin, mjd, flux_err, flux)
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+
+        data = acc.get(group_key)
+        if data is None:
+            data = acc[group_key] = _new_phot_group(instrument_id, stream_ids)
+        data["obj_id"].append(obj_id)
+        data["mjd"].append(mjd)
+        data["flux"].append(flux)
+        data["fluxerr"].append(flux_err)
+        data["filter"].append(phot["band"])
+        data["zp"].append(ZP_PER_SURVEY[survey])
+        data["magsys"].append("ab")
+        data["ra"].append(phot["ra"])
+        data["dec"].append(phot["dec"])
+        data["origin"].append(origin)
+
+
+def _split_phot_group(data):
+    """Yield <=MAX_PHOT_ROWS_PER_POST sub-posts, never splitting one obj's
+    points across two posts."""
+    n = len(data["mjd"])
+    if n <= MAX_PHOT_ROWS_PER_POST:
+        yield data
+        return
+    cols = [k for k in data if k not in ("obj_id", "group_ids", "stream_ids",
+                                         "instrument_id")]
+    cur = _new_phot_group(data["instrument_id"], data["stream_ids"])
+    count, cur_obj = 0, None
+    for i in range(n):
+        oid = data["obj_id"][i]
+        if count >= MAX_PHOT_ROWS_PER_POST and oid != cur_obj:
+            yield cur
+            cur = _new_phot_group(data["instrument_id"], data["stream_ids"])
+            count = 0
+        cur["obj_id"].append(oid)
+        for k in cols:
+            cur[k].append(data[k][i])
+        count += 1
+        cur_obj = oid
+    if cur["mjd"]:
+        yield cur
+
+
+def flush_photometry(acc, user, session):
+    """Post all accumulated photometry, one call per (instrument, streams) group.
+    Returns True only if every post landed (so the caller can withhold the Kafka
+    offset commit and let the batch replay on a transient failure)."""
+    ok = True
+    for data in acc.values():
+        for chunk in _split_phot_group(data):
+            try:
+                ids, _ = add_external_photometry(chunk, user, session)
+                if ids is None:  # add_external_photometry swallows errors -> (None, None)
+                    ok = False
+            except Exception as e:
+                log(
+                    f"batched photometry post failed ({len(chunk['mjd'])} pts): "
+                    f"{type(e).__name__}: {str(e).splitlines()[0][:200]}"
+                )
+                ok = False
+    return ok
+
+
+def ingest_photometry_array(
+    photometry_array,
+    obj_id,
+    user,
+    session,
+    programid2streamid,
+    survey2instrumentid,
+):
+    """Ingest one object's Boom photometry into SkyPortal (single-record path)."""
+    acc, seen = {}, set()
+    accumulate_photometry_array(
+        acc, seen, photometry_array, obj_id, programid2streamid, survey2instrumentid
+    )
+    flush_photometry(acc, user, session)
 
 
 def make_thumbnail(
@@ -298,13 +340,13 @@ def make_thumbnail(
             rotpa = hdu[0].header.get("ROTPA", None)
             data = hdu[0].data
 
+    # Use the matplotlib OO API (not pyplot) so rendering is thread-safe and can
+    # run in a ThreadPoolExecutor off the ingestion hot path.
     buff = io.BytesIO()
-    plt.close("all")
-    fig = plt.figure()
-    fig.set_size_inches(4, 4, forward=False)
-    ax = plt.Axes(fig, [0.0, 0.0, 1.0, 1.0])
+    fig = Figure(figsize=(4, 4))
+    FigureCanvasAgg(fig)
+    ax = fig.add_axes([0.0, 0.0, 1.0, 1.0])
     ax.set_axis_off()
-    fig.add_axes(ax)
 
     # Clean the data
     img = np.array(data)
@@ -343,10 +385,8 @@ def make_thumbnail(
             log(f"Failed to rotate LSST image for obj_id {obj_id}: {e}")
 
     ax.imshow(img_norm, cmap="bone", origin="lower", vmin=vmin, vmax=vmax)
-    plt.savefig(buff, dpi=42)
-
+    fig.savefig(buff, dpi=42)
     buff.seek(0)
-    plt.close("all")
 
     thumbnail_dict = {
         "obj_id": obj_id,
@@ -473,6 +513,8 @@ def process_record(
     survey2instrumentid,
     user,
     boom_client,
+    phot_acc=None,
+    phot_seen=None,
 ):
     """Process a single decoded BOOM alert ``record`` against ``session``.
 
@@ -598,14 +640,21 @@ def process_record(
 
     session.commit()
 
-    ingest_photometry_array(
-        record.get("photometry", []),
-        obj_id,
-        user,
-        session,
-        programid2streamid,
-        survey2instrumentid,
-    )
+    if phot_acc is not None:
+        # batched path: defer the post, aggregate across the whole batch
+        accumulate_photometry_array(
+            phot_acc, phot_seen, record.get("photometry", []), obj_id,
+            programid2streamid, survey2instrumentid,
+        )
+    else:
+        ingest_photometry_array(
+            record.get("photometry", []),
+            obj_id,
+            user,
+            session,
+            programid2streamid,
+            survey2instrumentid,
+        )
 
     session.commit()
 
@@ -641,14 +690,20 @@ def process_record(
                         f"Failed to get cutouts for match object {match_obj_id} from survey {match_survey}: {e}"
                     )
 
-            ingest_photometry_array(
-                match["photometry"],
-                match_obj_id,
-                user,
-                session,
-                programid2streamid,
-                survey2instrumentid,
-            )
+            if phot_acc is not None:
+                accumulate_photometry_array(
+                    phot_acc, phot_seen, match["photometry"], match_obj_id,
+                    programid2streamid, survey2instrumentid,
+                )
+            else:
+                ingest_photometry_array(
+                    match["photometry"],
+                    match_obj_id,
+                    user,
+                    session,
+                    programid2streamid,
+                    survey2instrumentid,
+                )
 
             associated_with.add(match_obj_id)
 
@@ -691,6 +746,84 @@ def process_record(
     session.commit()
 
     return boom_filters
+
+
+def committable_messages(msg_results, flush_ok):
+    """Per (topic, partition), the last message in an unbroken run of successes
+    (stop at the first failure) — the safe Kafka commit watermark for the batch.
+    If the photometry flush failed, nothing is committable so the whole batch
+    replays (writes are idempotent). Pure function; unit-tested.
+
+    msg_results: list[(msg, ok)] in consume order.
+    """
+    if not flush_ok:
+        return []
+    failed_partitions = set()
+    watermark = {}
+    for msg, ok in msg_results:
+        tp = (msg.topic(), msg.partition())
+        if tp in failed_partitions:
+            continue
+        if ok:
+            watermark[tp] = msg
+        else:
+            failed_partitions.add(tp)
+    return list(watermark.values())
+
+
+def process_batch(
+    pairs,
+    db_session,
+    *,
+    boom_filters,
+    programid2streamid,
+    survey2instrumentid,
+    user,
+    boom_client,
+):
+    """Ingest a batch of (kafka_msg, decoded_record) pairs. Each record's
+    candidate/annotation/match/super-obj work runs in its own session (same
+    isolation as the per-record loop), but photometry is aggregated across the
+    whole batch and posted in one cross-object call per (instrument, streams)
+    group — amortizing add_external_photometry's per-call preamble and PhotStat.
+
+    Returns ``(boom_filters, committable_msgs)``: the (possibly refreshed) filter
+    mapping and the per-partition Kafka commit watermark (only messages whose
+    record fully succeeded AND whose photometry flushed), so a transiently-failed
+    record mid-batch is replayed rather than skipped.
+    """
+    phot_acc, phot_seen = {}, set()
+    msg_results = []
+    for msg, record in pairs:
+        ok = True
+        try:
+            with db_session() as session:
+                boom_filters = process_record(
+                    record,
+                    session,
+                    boom_filters=boom_filters,
+                    programid2streamid=programid2streamid,
+                    survey2instrumentid=survey2instrumentid,
+                    user=user,
+                    boom_client=boom_client,
+                    phot_acc=phot_acc,
+                    phot_seen=phot_seen,
+                )
+        except Exception as e:
+            traceback.print_exc()
+            log(
+                f"Unexpected error processing alert candid={record.get('candid')} "
+                f"obj={record.get('objectId')}: {e}"
+            )
+            ok = False
+        msg_results.append((msg, ok))
+
+    flush_ok = True
+    if phot_acc:
+        with db_session() as session:
+            flush_ok = flush_photometry(phot_acc, user, session)
+
+    return boom_filters, committable_messages(msg_results, flush_ok)
 
 
 def main():
@@ -762,7 +895,10 @@ def main():
     topic_names = kafka_params.get("topics", ["ZTF_alerts_results", "LSST_alerts_results"])
     consumer.subscribe(topic_names)
     log(f"Subscribed to topics: {topic_names}")
-    # Poll for messages from the topic
+    # Batch-poll: pull up to `max_poll` messages per round and ingest them as one
+    # batch so photometry can be aggregated across alerts (see process_batch).
+    max_poll = int(api_params.get("max_poll_messages", params.get("max_poll_messages", 200)))
+    poll_timeout = float(params.get("poll_timeout", 5.0))
     is_empty_poll_logged = False
     heartbeat = datetime.now()
     while True:
@@ -770,59 +906,52 @@ def main():
             heartbeat = datetime.now()
             log("Boom listener heartbeat.")
 
-        msg = consumer.poll(timeout=30.0)
-        if msg is None:
-            if not is_empty_poll_logged: # only log the first time we get an empty poll to avoid spamming the logs
+        msgs = consumer.consume(num_messages=max_poll, timeout=poll_timeout)
+        if not msgs:
+            if not is_empty_poll_logged:
                 log("No message received within the timeout period.")
                 is_empty_poll_logged = True
             continue
-        if msg.error():
-            # Handle any errors
-            if msg.error().code() == KafkaError._PARTITION_EOF:
-                log("End of partition reached.")
-                continue
-            else:
-                log(f"Error: {msg.error()}")
-                continue
-        is_empty_poll_logged = False # reset the flag when we successfully receive a message
+        is_empty_poll_logged = False
 
-        # Successfully received a message
-        record = read_avro(msg)
-
-        if record is None:
-            log("No record found in the Avro message")
+        pairs = []
+        for msg in msgs:
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    log("End of partition reached.")
+                else:
+                    log(f"Error: {msg.error()}")
+                continue
+            record = read_avro(msg)
+            if record is None:
+                log("No record found in the Avro message")
+                continue
+            pairs.append((msg, record))
+        if not pairs:
             continue
 
+        committable = []
         try:
-            with DBSession() as session:
-                boom_filters = process_record(
-                    record,
-                    session,
-                    boom_filters=boom_filters,
-                    programid2streamid=programid2streamid,
-                    survey2instrumentid=survey2instrumentid,
-                    user=user,
-                    boom_client=boom_client,
-                )
+            boom_filters, committable = process_batch(
+                pairs,
+                DBSession,
+                boom_filters=boom_filters,
+                programid2streamid=programid2streamid,
+                survey2instrumentid=survey2instrumentid,
+                user=user,
+                boom_client=boom_client,
+            )
         except Exception as e:
             traceback.print_exc()
-            log(
-                f"Unexpected error processing alert candid={record.get('candid')} "
-                f"obj={record.get('objectId')}: {e}"
-            )
-            continue
+            log(f"Unexpected error processing batch of {len(pairs)} alerts: {e}")
 
-        # The message is now fully ingested and committed to Postgres, so advance
-        # the Kafka consumer group's offset past it. enable.auto.commit is False,
-        # so this is the only place offsets move forward. Committing only after a
-        # successful write gives at-least-once delivery, which is safe because
-        # duplicate candidates are rejected by the IntegrityError guard above
-        # (effectively-once). This is what lets several consumers in the same group
-        # rebalance/restart without replaying the whole topic retention each time.
-        # Commit asynchronously so the poll loop is not blocked on a broker
-        # round-trip per message; the small replay window on an unclean shutdown is
-        # harmless given the idempotent writes.
-        consumer.commit(message=msg, asynchronous=True)
+        # Advance offsets only to the per-partition watermark of fully-successful
+        # records (process_batch withholds anything past a transient failure or a
+        # failed photometry flush, so it replays). enable.auto.commit is False, so
+        # this is the only place offsets move forward; at-least-once is safe because
+        # writes are idempotent. Async so the loop isn't blocked on the broker.
+        for msg in committable:
+            consumer.commit(message=msg, asynchronous=True)
 
 
 if __name__ == "__main__":
