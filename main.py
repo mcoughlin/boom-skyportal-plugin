@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import gzip
 import io
@@ -29,7 +30,7 @@ from sqlalchemy.exc import IntegrityError
 from baselayer.app.env import load_env
 from baselayer.app.models import init_db
 from baselayer.log import make_log
-from skyportal.handlers.api.photometry import add_external_photometry
+from skyportal.handlers.api.photometry import commit_external_photometry
 from skyportal.handlers.api.thumbnail import post_thumbnail
 from skyportal.models import (
     Annotation,
@@ -291,21 +292,32 @@ def _split_phot_group(data):
 def flush_photometry(acc, user, session):
     """Post all accumulated photometry, one call per (instrument, streams) group.
     Returns True only if every post landed (so the caller can withhold the Kafka
-    offset commit and let the batch replay on a transient failure)."""
-    ok = True
-    for data in acc.values():
-        for chunk in _split_phot_group(data):
-            try:
-                ids, _ = add_external_photometry(chunk, user, session)
-                if ids is None:  # add_external_photometry swallows errors -> (None, None)
+    offset commit and let the batch replay on a transient failure).
+
+    add_external_photometry is a coroutine since skyportal #6140, so we post
+    through the commit_external_photometry bridge, which opens its own async
+    session, re-loads the user by id, writes, and commits. ``session`` is no
+    longer used for the write — callers must have committed any obj referenced
+    here, since the bridge's separate session only sees committed rows. One
+    event loop per flush (not per chunk)."""
+
+    async def _post_all():
+        ok = True
+        for data in acc.values():
+            for chunk in _split_phot_group(data):
+                try:
+                    ids = await commit_external_photometry(chunk, user.id)
+                    if ids is None:  # bridge swallows errors -> None
+                        ok = False
+                except Exception as e:
+                    log(
+                        f"batched photometry post failed ({len(chunk['mjd'])} pts): "
+                        f"{type(e).__name__}: {str(e).splitlines()[0][:200]}"
+                    )
                     ok = False
-            except Exception as e:
-                log(
-                    f"batched photometry post failed ({len(chunk['mjd'])} pts): "
-                    f"{type(e).__name__}: {str(e).splitlines()[0][:200]}"
-                )
-                ok = False
-    return ok
+        return ok
+
+    return asyncio.run(_post_all())
 
 
 def ingest_photometry_array(
@@ -696,6 +708,11 @@ def process_record(
                     programid2streamid, survey2instrumentid,
                 )
             else:
+                # commit the (newly created) match obj so the bridge's separate
+                # async session can see it before its photometry is ingested.
+                # The batched path doesn't need this — process_record commits at
+                # its end, before the batch-level flush_photometry.
+                session.commit()
                 ingest_photometry_array(
                     match["photometry"],
                     match_obj_id,
