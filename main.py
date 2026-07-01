@@ -439,10 +439,10 @@ def accumulate_thumbnails(thumb_acc, seen, alert, survey):
 
 def flush_thumbnails(thumb_acc, user):
     """Post all accumulated thumbnails through post_thumbnail (a coroutine since
-    skyportal migrated it), bridged from this sync loop via asyncio.run against
-    its own async session -- mirroring flush_photometry. Callers must have
-    committed the referenced objs, since the bridge's separate session only sees
-    committed rows. One event loop per flush."""
+    skyportal migrated it), bridged from this sync loop via asyncio.run. Callers
+    must have committed the referenced objs, since these separate sessions only
+    see committed rows. One event loop per flush; returns True only if every
+    thumbnail landed."""
     if not thumb_acc:
         return True
 
@@ -453,17 +453,21 @@ def flush_thumbnails(thumb_acc, user):
 
     async def _post_all():
         ok = True
-        async with baselayer_models.async_plain_session_factory() as async_session:
-            for thumb in thumb_acc:
-                try:
-                    await post_thumbnail(thumb, user.id, async_session)
-                except Exception as e:
-                    log(
-                        f"thumbnail post failed for {thumb.get('obj_id')} "
-                        f"({thumb.get('ttype')}): {type(e).__name__}: "
-                        f"{str(e).splitlines()[0][:200]}"
-                    )
-                    ok = False
+        for thumb in thumb_acc:
+            # A fresh session per thumbnail: post_thumbnail commits internally, so
+            # a failure (bad image, DB error) must not poison the rest -- the
+            # context manager rolls back/closes the bad one and the next starts
+            # clean. Mirrors the photometry bridge's one-session-per-unit design.
+            try:
+                async with baselayer_models.async_plain_session_factory() as session:
+                    await post_thumbnail(thumb, user.id, session)
+            except Exception as e:
+                log(
+                    f"thumbnail post failed for {thumb.get('obj_id')} "
+                    f"({thumb.get('ttype')}): {type(e).__name__}: "
+                    f"{str(e).splitlines()[0][:200]}"
+                )
+                ok = False
         return ok
 
     return asyncio.run(_post_all())
