@@ -410,10 +410,16 @@ def make_thumbnail(
     return thumbnail_dict
 
 
-def add_thumbnails(alert, survey, session):
+def accumulate_thumbnails(thumb_acc, seen, alert, survey):
+    """Build thumbnail dicts for one alert's cutouts and add them to the batch
+    accumulator (deduped by (obj_id, ttype)). Rendering is CPU-only; the DB write
+    is deferred to flush_thumbnails, which runs once the objs are committed."""
     for cutout_type, thumbnail_type in thumbnail_types:
         if cutout_type not in alert:
             log(f"Cutout key {cutout_type} not found in alert")
+            continue
+        key = (alert["objectId"], thumbnail_type)
+        if key in seen:
             continue
         try:
             thumbnail = make_thumbnail(
@@ -421,19 +427,54 @@ def add_thumbnails(alert, survey, session):
                 alert[cutout_type],
                 cutout_type,
                 thumbnail_type,
-                survey
+                survey,
             )
         except Exception as e:
             traceback.print_exc()
             log(f"Failed to create thumbnail for cutout type {cutout_type}: {e}")
             continue
-        try:
-            with session.begin_nested():
-                post_thumbnail(thumbnail, user_id=1, session=session)
-        except Exception as e:
-            traceback.print_exc()
-            log(f"Failed to post thumbnail for cutout type {cutout_type}: {e}")
-            continue
+        seen.add(key)
+        thumb_acc.append(thumbnail)
+
+
+def flush_thumbnails(thumb_acc, user):
+    """Post all accumulated thumbnails through post_thumbnail (a coroutine since
+    skyportal migrated it), bridged from this sync loop via asyncio.run against
+    its own async session -- mirroring flush_photometry. Callers must have
+    committed the referenced objs, since the bridge's separate session only sees
+    committed rows. One event loop per flush."""
+    if not thumb_acc:
+        return True
+
+    # async_plain_session_factory is a module global set by init_db, so reach it
+    # through the module at call time (not a top-level import bound to its
+    # pre-init None) -- same pattern as commit_external_photometry.
+    from baselayer.app import models as baselayer_models
+
+    async def _post_all():
+        ok = True
+        async with baselayer_models.async_plain_session_factory() as async_session:
+            for thumb in thumb_acc:
+                try:
+                    await post_thumbnail(thumb, user.id, async_session)
+                except Exception as e:
+                    log(
+                        f"thumbnail post failed for {thumb.get('obj_id')} "
+                        f"({thumb.get('ttype')}): {type(e).__name__}: "
+                        f"{str(e).splitlines()[0][:200]}"
+                    )
+                    ok = False
+        return ok
+
+    return asyncio.run(_post_all())
+
+
+def ingest_thumbnails(alert, survey, user):
+    """Single-record path: build one alert's thumbnails and post them now (the
+    referenced obj must already be committed)."""
+    acc, seen = [], set()
+    accumulate_thumbnails(acc, seen, alert, survey)
+    flush_thumbnails(acc, user)
 
 
 def read_avro(msg):
@@ -528,6 +569,8 @@ def process_record(
     boom_client,
     phot_acc=None,
     phot_seen=None,
+    thumb_acc=None,
+    thumb_seen=None,
 ):
     """Process a single decoded BOOM alert ``record`` against ``session``.
 
@@ -597,8 +640,6 @@ def process_record(
                 record["dec"],
                 session
             )
-            if obj_created:
-                add_thumbnails(record, survey, session)
 
         # create the candidate if it has not been created yet for this filter and this candid
         try:
@@ -660,6 +701,14 @@ def process_record(
 
     session.commit()
 
+    # thumbnails for a newly-created obj: deferred until now (post-commit) so the
+    # bridge's separate async session can see the obj -- mirrors the photometry path.
+    if obj_created:
+        if thumb_acc is not None:
+            accumulate_thumbnails(thumb_acc, thumb_seen, record, survey)
+        else:
+            ingest_thumbnails(record, survey, user)
+
     if phot_acc is not None:
         # batched path: defer the post, aggregate across the whole batch
         accumulate_photometry_array(
@@ -699,12 +748,12 @@ def process_record(
             )
 
             # TODO: grab the cutouts for the match object (if newly added) from the BOOM API
+            cutouts = None
             if match_obj_created:
                 try:
                     cutouts = boom_client.get_cutouts_by_object_id(
                         match_survey, match_obj_id
                     )
-                    add_thumbnails(cutouts, match_survey, session)
                 except Exception as e:
                     log(
                         f"Failed to get cutouts for match object {match_obj_id} from survey {match_survey}: {e}"
@@ -715,11 +764,15 @@ def process_record(
                     phot_acc, phot_seen, match["photometry"], match_obj_id,
                     programid2streamid, survey2instrumentid,
                 )
+                if cutouts is not None and thumb_acc is not None:
+                    accumulate_thumbnails(
+                        thumb_acc, thumb_seen, cutouts, match_survey
+                    )
             else:
                 # commit the (newly created) match obj so the bridge's separate
-                # async session can see it before its photometry is ingested.
-                # The batched path doesn't need this — process_record commits at
-                # its end, before the batch-level flush_photometry.
+                # async session can see it before its photometry/thumbnails are
+                # ingested. The batched path doesn't need this — process_record
+                # commits at its end, before the batch-level flushes.
                 session.commit()
                 ingest_photometry_array(
                     match["photometry"],
@@ -729,6 +782,8 @@ def process_record(
                     programid2streamid,
                     survey2instrumentid,
                 )
+                if cutouts is not None:
+                    ingest_thumbnails(cutouts, match_survey, user)
 
             associated_with.add(match_obj_id)
 
@@ -818,6 +873,7 @@ def process_batch(
     record mid-batch is replayed rather than skipped.
     """
     phot_acc, phot_seen = {}, set()
+    thumb_acc, thumb_seen = [], set()
     msg_results = []
     for msg, record in pairs:
         ok = True
@@ -833,6 +889,8 @@ def process_batch(
                     boom_client=boom_client,
                     phot_acc=phot_acc,
                     phot_seen=phot_seen,
+                    thumb_acc=thumb_acc,
+                    thumb_seen=thumb_seen,
                 )
         except Exception as e:
             traceback.print_exc()
@@ -847,6 +905,12 @@ def process_batch(
     if phot_acc:
         with db_session() as session:
             flush_ok = flush_photometry(phot_acc, user, session)
+
+    # Thumbnails post via their own async session (no db_session needed) after the
+    # objs are committed. Cosmetic, so a thumbnail failure is logged but does NOT
+    # gate the Kafka commit watermark (unlike photometry).
+    if thumb_acc:
+        flush_thumbnails(thumb_acc, user)
 
     return boom_filters, committable_messages(msg_results, flush_ok)
 
