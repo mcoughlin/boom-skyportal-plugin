@@ -3,6 +3,8 @@ services:
         boom:
             repo: https://github.com/Theodlz/boom-skyportal-plugin.git
             rev: main
+            # Number of Kafka-consumer instances (see supervisor.conf.template).
+            numprocs: 2
             params:
                 kafka:
                     host: kaboom.caltech.edu
